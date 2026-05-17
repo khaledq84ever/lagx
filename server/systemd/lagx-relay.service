@@ -1,0 +1,23 @@
+[Unit]
+Description=LagX UDP relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lagx
+Group=lagx
+WorkingDirectory=/opt/lagx/server
+Environment=LAGX_PORT=51820
+EnvironmentFile=-/etc/lagx/relay.env
+ExecStart=/usr/bin/python3 /opt/lagx/server/relay.py
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

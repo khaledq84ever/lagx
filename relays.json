@@ -1,0 +1,6 @@
+[
+  {"name": "Local (test)",   "host": "127.0.0.1",   "port": 51820, "region": "LOCAL"},
+  {"name": "Frankfurt",      "host": "203.0.113.10","port": 51820, "region": "EU"},
+  {"name": "New York",       "host": "198.51.100.20","port": 51820, "region": "NA"},
+  {"name": "Singapore",      "host": "192.0.2.30",  "port": 51820, "region": "APAC"}
+]

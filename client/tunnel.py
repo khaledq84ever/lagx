@@ -1,0 +1,116 @@
+"""Client-side UDP tunnel encapsulator.
+
+The packet-capture layer (divert.py) hands us raw outbound game packets along with
+their destination (ip, port). We:
+  1. Look up the currently-active relay from the Router.
+  2. Build a DATA_OUT packet, encrypt the payload, send to relay.
+  3. On DATA_IN reply, decrypt and call the reinject_cb so divert.py can spoof the
+     response back into the game's UDP socket.
+
+This module is transport-only — it doesn't know how packets were captured (WinDivert,
+NFQUEUE, or a unit test piping raw bytes in).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import socket
+import struct
+import time
+from collections.abc import Callable
+
+from .protocol import (
+    HDR_LEN, T_DATA_IN, T_DATA_OUT, make_nonce, pack_header, unpack_header,
+)
+from .router import Router
+
+LOG = logging.getLogger("lagx.tunnel")
+
+ReinjectCB = Callable[[bytes, tuple[str, int]], None]
+# (payload, source_addr) — source_addr is the game server (so the game's socket sees
+# the reply as coming from the right peer).
+
+
+class Tunnel:
+    def __init__(self, router: Router, aead, reinject_cb: ReinjectCB | None = None):
+        self.router = router
+        self.aead = aead
+        self.reinject_cb = reinject_cb or (lambda *_: None)
+        self.session_id = random.randint(1, 0x7FFFFFFF)
+        self._seq = 0
+        self._sock: socket.socket | None = None
+        self._running = False
+        self.pkts_out = 0
+        self.pkts_in = 0
+
+    async def start(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setblocking(False)
+        # Big buffers so we don't drop bursts on a flaky path
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        self._sock.bind(("0.0.0.0", 0))
+        self._running = True
+        asyncio.get_event_loop().add_reader(self._sock.fileno(), self._on_relay_recv)
+        LOG.info("tunnel session=%x local=%s", self.session_id, self._sock.getsockname())
+
+    async def stop(self):
+        self._running = False
+        if self._sock:
+            asyncio.get_event_loop().remove_reader(self._sock.fileno())
+            self._sock.close()
+            self._sock = None
+
+    def send(self, payload: bytes, dest: tuple[str, int]) -> bool:
+        """Encapsulate `payload` (destined for game server `dest`) and send through the
+        currently-active relay. Returns False if no route is available."""
+        if self._sock is None:
+            return False
+        active = self.router.active
+        if active is None:
+            return False
+        relay = active.relay
+        self._seq = (self._seq + 1) & 0xFFFFFFFF
+        ts = int(time.time() * 1_000_000) & 0xFFFFFFFF
+        hdr = pack_header(T_DATA_OUT, self.session_id, self._seq, ts)
+        meta = struct.pack("!4sH", socket.inet_aton(dest[0]), dest[1])
+        aad = hdr + meta
+        try:
+            ct = self.aead.encrypt(make_nonce(self.session_id, self._seq), payload, aad)
+            self._sock.sendto(hdr + meta + ct, (relay.host, relay.port))
+            self.pkts_out += 1
+            return True
+        except OSError as e:
+            LOG.warning("relay send fail: %s", e)
+            return False
+
+    def _on_relay_recv(self):
+        try:
+            data, _ = self._sock.recvfrom(65535)
+        except (BlockingIOError, OSError):
+            return
+        h = unpack_header(data)
+        if h is None:
+            return
+        _, ptype, sid, seq, _ = h
+        if ptype != T_DATA_IN or sid != self.session_id:
+            return
+        if len(data) < HDR_LEN + 6:
+            return
+        meta = data[HDR_LEN:HDR_LEN + 6]
+        ip_b, port = struct.unpack("!4sH", meta)
+        src = (socket.inet_ntoa(ip_b), port)
+        ct = data[HDR_LEN + 6:]
+        aad = data[:HDR_LEN] + meta
+        try:
+            payload = self.aead.decrypt(make_nonce(sid, seq), ct, aad)
+        except Exception as e:
+            LOG.debug("decrypt reply: %s", e)
+            return
+        self.pkts_in += 1
+        try:
+            self.reinject_cb(payload, src)
+        except Exception:
+            LOG.exception("reinject callback raised")
