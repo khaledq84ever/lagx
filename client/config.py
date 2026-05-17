@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "psk_hex": DEFAULT_PSK,
     "last_game_id": "valorant",
     "capture_backend": "auto",
+    "n_paths": 1,           # 1 = single best route; 2-3 = multi-path duplication
 }
 
 

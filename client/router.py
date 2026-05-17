@@ -74,3 +74,16 @@ class Router:
             "switched route %s -> %s (%s)",
             old.name if old else "<none>", new.name, reason,
         )
+
+    def top_n(self, n: int) -> list[RelayStats]:
+        """Return the best N reachable relays, sorted by score ascending.
+
+        Used by multi-path tunneling: every outbound packet is duplicated across
+        the top N routes so the game server gets whichever copy arrives first.
+        Unreachable relays (score == inf) are filtered out.
+        """
+        if n <= 0:
+            return []
+        reachable = [r for r in self.prober.stats() if r.score != float("inf")]
+        reachable.sort(key=lambda r: r.score)
+        return reachable[:n]

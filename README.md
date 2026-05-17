@@ -136,8 +136,15 @@ What's **scaffolded but needs work**:
 
 - ⚠️ WinDivert packet capture (`client/divert.py`) — fully implemented but only runs on
   Windows with admin rights. On Linux the equivalent NFQUEUE path is in the same file.
-- ⚠️ Multi-path duplication — interface exists in router.py, not wired into tunnel yet.
-- ⚠️ DNS leak prevention — see `client/dns_guard.py` (push 1.1.1.1, block IPv6 on tunnel iface).
+- ⚠️ DNS leak prevention — planned (push 1.1.1.1, block IPv6 on tunnel iface).
+
+What's **done since v0.1**:
+
+- ✅ **Multi-path duplication** (`router.top_n` + `tunnel.send` fan-out + content-hash
+  dedup on reply). Set `n_paths` in `settings.json` or pick `2 routes` / `3 routes`
+  in the GUI. Each outbound game packet is sent through the top-N best relays in
+  parallel; replies are deduped by `blake2b(src, payload)`. Costs Nx upstream
+  bandwidth, near-zero loss on flaky paths.
 
 What's **honest gaps** vs commercial ExitLag:
 
@@ -198,7 +205,7 @@ python main.py             # Linux/macOS dev
 - [ ] Auto-update channel for client
 
 **Phase 2 — Multi-path**
-- [ ] Duplicate top-2 routes; client-side dedup by seq
+- [x] Duplicate top-N routes; client-side dedup by (src, payload-hash)
 - [ ] Forward Error Correction (Reed-Solomon) over top route — 10 % overhead, cuts loss
       to ~0 % on mobile
 

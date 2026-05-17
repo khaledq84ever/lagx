@@ -348,6 +348,27 @@ def _():
     assert r.active.relay.name == "r0", "should have switched to r0"
 
 
+@t("router.top_n returns N best reachable relays in order")
+def _():
+    p = _fake_prober_with_scores(120, 30, 200, 60)
+    r = Router(p)
+    top2 = r.top_n(2)
+    assert [s.name for s in top2] == ["r1", "r3"], [s.name for s in top2]
+    top10 = r.top_n(10)
+    assert len(top10) == 4
+    assert r.top_n(0) == []
+
+
+@t("router.top_n filters out unreachable relays (score == inf)")
+def _():
+    p = _fake_prober_with_scores(50, 100)
+    # Mark r1 as unreachable
+    p.stats()[1].rtt_ms = float("inf")
+    r = Router(p)
+    top = r.top_n(3)
+    assert [s.name for s in top] == ["r0"], [s.name for s in top]
+
+
 @t("router emergency switches on sustained loss")
 async def _():
     p = _fake_prober_with_scores(50, 60)
@@ -484,6 +505,113 @@ async def _():
         s.close()
     finally:
         transport.close()
+
+
+# ── multi-path duplication ──────────────────────────────────────────────────
+
+section("multi-path tunneling")
+
+
+@t("tunnel with n_paths=2 sends through 2 relays")
+async def _():
+    t1, p1 = await _spawn_relay(52050)
+    t2, p2 = await _spawn_relay(52051)
+    loop = asyncio.get_event_loop()
+    echo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); echo.setblocking(False)
+    echo.bind(("127.0.0.1", 19990))
+    def _e():
+        try:
+            d, a = echo.recvfrom(4096); echo.sendto(b"R:" + d, a)
+        except BlockingIOError: pass
+    loop.add_reader(echo.fileno(), _e)
+    try:
+        prober = Prober([
+            {"name": "A", "host": "127.0.0.1", "port": 52050, "region": "R"},
+            {"name": "B", "host": "127.0.0.1", "port": 52051, "region": "R"},
+        ])
+        await prober.start()
+        router = Router(prober)
+        aead = new_aead(PSK)
+        got = []
+        tunnel = Tunnel(router, aead, reinject_cb=lambda p, s: got.append((p, s)), n_paths=2)
+        await tunnel.start()
+        for _ in range(20):
+            router.tick()
+            if router.top_n(2) and len(router.top_n(2)) == 2:
+                break
+            await asyncio.sleep(0.1)
+        assert len(router.top_n(2)) == 2
+        tunnel.send(b"MP", ("127.0.0.1", 19990))
+        # 2 paths means 2 OUT packets sent from the client
+        assert tunnel.pkts_out == 2, f"expected 2 outbound, got {tunnel.pkts_out}"
+        for _ in range(30):
+            await asyncio.sleep(0.05)
+            if tunnel.pkts_in >= 2: break
+        # Both relays should have forwarded + got a reply
+        assert tunnel.pkts_in >= 2, f"expected 2 inbound, got {tunnel.pkts_in}"
+        await prober.stop(); await tunnel.stop()
+    finally:
+        loop.remove_reader(echo.fileno()); echo.close()
+        t1.close(); t2.close()
+
+
+@t("tunnel dedupes duplicate replies from multiple paths")
+async def _():
+    t1, _ = await _spawn_relay(52060)
+    t2, _ = await _spawn_relay(52061)
+    loop = asyncio.get_event_loop()
+    echo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); echo.setblocking(False)
+    echo.bind(("127.0.0.1", 19989))
+    def _e():
+        try:
+            d, a = echo.recvfrom(4096); echo.sendto(b"DUP:" + d, a)
+        except BlockingIOError: pass
+    loop.add_reader(echo.fileno(), _e)
+    try:
+        prober = Prober([
+            {"name": "A", "host": "127.0.0.1", "port": 52060, "region": "R"},
+            {"name": "B", "host": "127.0.0.1", "port": 52061, "region": "R"},
+        ])
+        await prober.start()
+        router = Router(prober)
+        aead = new_aead(PSK)
+        got = []
+        tunnel = Tunnel(router, aead, reinject_cb=lambda p, s: got.append((p, s)), n_paths=2)
+        await tunnel.start()
+        for _ in range(20):
+            router.tick()
+            if len(router.top_n(2)) == 2: break
+            await asyncio.sleep(0.1)
+        tunnel.send(b"X", ("127.0.0.1", 19989))
+        for _ in range(30):
+            await asyncio.sleep(0.05)
+            if tunnel.pkts_in >= 2: break
+        # Game replied via both relays => 2 inbound, but reinject_cb fires only once
+        assert tunnel.pkts_in >= 2, f"pkts_in={tunnel.pkts_in}"
+        assert tunnel.pkts_reinjected == 1, f"pkts_reinjected={tunnel.pkts_reinjected}"
+        assert tunnel.pkts_deduped >= 1, f"pkts_deduped={tunnel.pkts_deduped}"
+        assert len(got) == 1, f"reinjected {len(got)} times"
+        assert got[0] == (b"DUP:X", ("127.0.0.1", 19989))
+        await prober.stop(); await tunnel.stop()
+    finally:
+        loop.remove_reader(echo.fileno()); echo.close()
+        t1.close(); t2.close()
+
+
+@t("tunnel falls back to active relay when prober scores incomplete")
+def _():
+    # Build a router with one stat at inf so top_n returns [] but active is set
+    p = Prober([{"name": "a", "host": "127.0.0.1", "port": 99, "region": "R"}])
+    # active set manually to simulate "we picked it earlier"
+    from client.router import ActiveRoute
+    p.stats()[0].rtt_ms = float("inf")  # unreachable now
+    router = Router(p)
+    router.active = ActiveRoute(relay=p.stats()[0], since=time.monotonic())
+    aead = new_aead(PSK)
+    tunnel = Tunnel(router, aead, n_paths=2)
+    # No socket open — send should still report False because there's no socket,
+    # but it should at least walk the fallback path and not crash.
+    assert tunnel.send(b"x", ("127.0.0.1", 1)) is False
 
 
 # ── NAT flow lifecycle ──────────────────────────────────────────────────────

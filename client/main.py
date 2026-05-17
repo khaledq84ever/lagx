@@ -76,7 +76,11 @@ class Engine:
         self.aead = new_aead(self.settings["psk_hex"])
         self.prober = Prober(self.relays)
         self.router = Router(self.prober)
-        self.tunnel = Tunnel(self.router, self.aead, reinject_cb=self._reinject)
+        self.tunnel = Tunnel(
+            self.router, self.aead,
+            reinject_cb=self._reinject,
+            n_paths=int(self.settings.get("n_paths", 1)),
+        )
         self.capture = make_capture(self.settings.get("capture_backend"))
         self.running = False
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -244,8 +248,19 @@ class App:
         game_names = [g.name for g in profiles.GAMES]
         self.game_var = tk.StringVar(value=self._default_game_name())
         cb = ttk.Combobox(picker, values=game_names, textvariable=self.game_var,
-                          state="readonly", width=28)
+                          state="readonly", width=26)
         cb.pack(side="left")
+
+        ttk.Label(picker, text="   Multi-path").pack(side="left", padx=(14, 6))
+        self.paths_var = tk.StringVar(
+            value=self._paths_label(int(self.engine.settings.get("n_paths", 1)))
+        )
+        paths_cb = ttk.Combobox(
+            picker, values=["Off (1 route)", "2 routes", "3 routes"],
+            textvariable=self.paths_var, state="readonly", width=14,
+        )
+        paths_cb.pack(side="left")
+        paths_cb.bind("<<ComboboxSelected>>", self._on_paths_changed)
 
         # Relay table
         table_card = ttk.Frame(self.root, style="Card.TFrame")
@@ -301,6 +316,17 @@ class App:
                 return g.name
         return profiles.GAMES[0].name
 
+    @staticmethod
+    def _paths_label(n: int) -> str:
+        return {1: "Off (1 route)", 2: "2 routes", 3: "3 routes"}.get(n, "Off (1 route)")
+
+    def _on_paths_changed(self, _evt=None):
+        n = {"Off (1 route)": 1, "2 routes": 2, "3 routes": 3}.get(self.paths_var.get(), 1)
+        self.engine.tunnel.n_paths = n
+        self.engine.settings["n_paths"] = n
+        config.save_settings(self.engine.settings)
+        LOG.info("multi-path set to %d route(s)", n)
+
     def _toggle(self):
         if self.engine.running:
             self.engine.stop()
@@ -348,8 +374,11 @@ class App:
         # Status pill
         if self.engine.running and active_relay:
             self._draw_dot(ACCENT)
+            t = self.engine.tunnel
+            mp = f" · {t.n_paths}-path" if t.n_paths > 1 else ""
+            dedup = f" · deduped {t.pkts_deduped}" if t.pkts_deduped else ""
             self.status_lbl.configure(
-                text=f"connected — {active_relay.name}  ·  out {self.engine.tunnel.pkts_out}  in {self.engine.tunnel.pkts_in}",
+                text=f"connected — {active_relay.name}{mp}  ·  out {t.pkts_out}  in {t.pkts_reinjected}{dedup}",
             )
         elif active_relay:
             self._draw_dot(WARN)
